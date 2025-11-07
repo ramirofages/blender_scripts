@@ -1,86 +1,151 @@
 import bpy
 import bmesh
 from mathutils import Vector, Matrix, Quaternion
+from math import atan2, cos, sin
 
-def projected_tangent(v_from, v_to, normal):
-    e = (v_to - v_from)
-    e_proj = e - normal * e.dot(normal)
-    if e_proj.length_squared == 0:
+def newell_normal(verts):
+    """Compute polygon normal using Newell's method. verts: list of Vector (in same coord space)."""
+    nx = ny = nz = 0.0
+    n = len(verts)
+    for i in range(n):
+        v_curr = verts[i]
+        v_next = verts[(i + 1) % n]
+        nx += (v_curr.y - v_next.y) * (v_curr.z + v_next.z)
+        ny += (v_curr.z - v_next.z) * (v_curr.x + v_next.x)
+        nz += (v_curr.x - v_next.x) * (v_curr.y + v_next.y)
+    nvec = Vector((nx, ny, nz))
+    if nvec.length_squared == 0.0:
         return None
-    return e_proj.normalized()
+    return nvec.normalized()
 
-def make_basis_from_normal_and_tangent(normal, tangent):
+def face_major_axis_by_pca(verts, normal):
+    """
+    Project vertices into plane orthonormal basis and compute 2x2 covariance.
+    Return a 3D tangent vector (normalized) representing the major PCA axis in world/local coords.
+    """
+    # build any orthonormal basis (u, v, normal) for the plane
+    # pick helper that is not parallel to normal
+    helper = Vector((1.0, 0.0, 0.0))
+    if abs(normal.dot(helper)) > 0.999:
+        helper = Vector((0.0, 1.0, 0.0))
+    u = helper.cross(normal).normalized()  # first in-plane axis
+    v = normal.cross(u).normalized()       # second in-plane axis
+
+    # compute centroid
+    centroid = Vector((0.0, 0.0, 0.0))
+    for p in verts:
+        centroid += p
+    centroid /= len(verts)
+
+    # build 2D coordinates in (u,v)
+    xs = []
+    ys = []
+    for p in verts:
+        d = p - centroid
+        xs.append(d.dot(u))
+        ys.append(d.dot(v))
+
+    # compute covariance elements
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    cov_xx = cov_xy = cov_yy = 0.0
+    for x, y in zip(xs, ys):
+        dx = x - mean_x
+        dy = y - mean_y
+        cov_xx += dx * dx
+        cov_xy += dx * dy
+        cov_yy += dy * dy
+
+    # if degenerate (all points same), fallback to first edge vector
+    if cov_xx + cov_yy <= 1e-12:
+        # fallback vector: first edge direction projected to plane
+        fallback = (verts[1] - verts[0]) - normal * (verts[1] - verts[0]).dot(normal)
+        if fallback.length_squared == 0:
+            # absolute fallback
+            return u
+        return fallback.normalized()
+
+    # covariance matrix is [cov_xx cov_xy; cov_xy cov_yy]
+    # principal eigenvector angle:
+    theta = 0.5 * atan2(2.0 * cov_xy, cov_xx - cov_yy)
+    # principal vector in (u,v) coords
+    cx = cos(theta)
+    cy = sin(theta)
+    # map to 3D
+    major = (u * cx) + (v * cy)
+    if major.length_squared == 0:
+        return u
+    return major.normalized()
+
+def compute_face_basis_from_vertices(verts_local, eval_obj):
+    """
+    verts_local: list of vertices in evaluated object's local coordinates (Vector)
+    Returns: basis_mat (Matrix 3x3) in evaluated local space where columns are X (tangent), Y, Z (normal)
+    """
+    # compute robust normal with Newell
+    normal = newell_normal(verts_local)
+    if normal is None:
+        # fallback to Blender face normal via cross of first two edges
+        e = verts_local[1] - verts_local[0]
+        f = verts_local[2] - verts_local[0]
+        cz = e.cross(f)
+        if cz.length_squared == 0:
+            cz = Vector((0.0, 0.0, 1.0))
+        normal = cz.normalized()
+
+    # compute major in-plane axis using PCA
+    tangent = face_major_axis_by_pca(verts_local, normal)
+
+    # build orthonormal basis: x = tangent (in-plane), z = normal, y = z cross x
     z = normal.normalized()
-    if tangent is None or tangent.length_squared == 0:
-        helper = Vector((1, 0, 0))
+    x = tangent - z * tangent.dot(z)
+    if x.length_squared == 0:
+        # fallback choose axis
+        helper = Vector((1.0, 0.0, 0.0))
         if abs(z.dot(helper)) > 0.999:
-            helper = Vector((0, 1, 0))
+            helper = Vector((0.0, 1.0, 0.0))
         x = helper.cross(z).normalized()
     else:
-        x = tangent - z * tangent.dot(z)
-        if x.length_squared == 0:
-            helper = Vector((1, 0, 0))
-            if abs(z.dot(helper)) > 0.999:
-                helper = Vector((0, 1, 0))
-            x = helper.cross(z).normalized()
-        else:
-            x = x.normalized()
+        x = x.normalized()
     y = z.cross(x).normalized()
+
+    # columns are x,y,z -> construct matrix and transpose so columns become basis vectors
     mat = Matrix((x, y, z)).transposed()
     return mat
 
-def quad_size_along_basis(face, basis_x, basis_y):
-    verts = [v.co for v in face.verts]
-    vcount = len(verts)
-    sizes_x, sizes_y = [], []
-    for i in range(vcount):
-        a = verts[i]
-        b = verts[(i+1) % vcount]
-        edge = b - a
-        sizes_x.append(abs(edge.dot(basis_x)))
-        sizes_y.append(abs(edge.dot(basis_y)))
-    sx = max(sizes_x) or 0.01
-    sy = max(sizes_y) or 0.01
-    return sx, sy
+def compute_face_quaternion_world(eval_obj, face):
+    # collect face vertices in evaluated local coordinates
+    verts_local = [v.co.copy() for v in face.verts]
+    basis_mat = compute_face_basis_from_vertices(verts_local, eval_obj)
+    # convert basis to world space
+    world_basis = eval_obj.matrix_world.to_3x3() @ basis_mat
+    return world_basis.to_quaternion()
 
 def average_quaternions(quats):
-    """
-    Compute a simple averaged quaternion by summing (with sign alignment) and normalizing.
-    This is not a geodesic Slerp average but works well as a pragmatic mean for nearby rotations.
-    """
     if not quats:
         return None
-    # Start with first quaternion
-    q_sum = quats[0].copy()
-    for q in quats[1:]:
-        # Align sign to avoid antipodal cancellation
-        if q_sum.dot(q) < 0.0:
-            q = -q
-        q_sum = Quaternion((q_sum.w + q.w, q_sum.x + q.x, q_sum.y + q.y, q_sum.z + q.z))
+    q_sum = Quaternion((0.0, 0.0, 0.0, 0.0))
+    ref = quats[0]
+    for q in quats:
+        q_al = q
+        if ref.dot(q) < 0.0:
+            q_al = -q
+        q_sum.w += q_al.w
+        q_sum.x += q_al.x
+        q_sum.y += q_al.y
+        q_sum.z += q_al.z
+    # Blender Quaternion has .magnitude instead of .length
+    if q_sum.magnitude == 0:
+        return None
     q_sum.normalize()
     return q_sum
 
-def compute_face_quaternion_world(eval_obj, face):
-    # compute basis for face in local (evaluated) coords
-    normal = face.normal.copy()
-    v0, v1 = face.verts[0].co, face.verts[1].co
-    tangent = projected_tangent(v0, v1, normal)
-    basis_mat = make_basis_from_normal_and_tangent(normal, tangent)
-    # convert basis into world (3x3)
-    world_basis = eval_obj.matrix_world.to_3x3() @ basis_mat
-    # convert to quaternion (world space)
-    q = world_basis.to_quaternion()
-    return q
 
 def process_object_apply_rotation(obj):
-    """ Compute mean rotation from quads, set object rotation, rotate base mesh vertices by inverse local rotation,
-        and recompute origin to geometry median.
-    """
     if obj.type != 'MESH':
         print(f"Skipping non-mesh object: {obj.name}")
         return 0
 
-    # Use evaluated mesh to compute face normals/orientations (includes modifiers)
     depsgraph = bpy.context.evaluated_depsgraph_get()
     eval_obj = obj.evaluated_get(depsgraph)
     eval_mesh = eval_obj.to_mesh()
@@ -92,86 +157,69 @@ def process_object_apply_rotation(obj):
     face_quats = []
     quad_count = 0
     for face in bm.faces:
-        if len(face.verts) != 4:
+        if len(face.verts) < 3:
             continue
         q_world = compute_face_quaternion_world(eval_obj, face)
         face_quats.append(q_world)
         quad_count += 1
 
-    # cleanup evaluated mesh objects
     bm.free()
     eval_obj.to_mesh_clear()
 
     if quad_count == 0:
-        print(f"No quads found for object {obj.name}; skipping rotation change.")
+        print(f"No valid faces for object {obj.name}; skipping.")
         return 0
 
-    # Average quaternions (world space)
     mean_world_q = average_quaternions(face_quats)
     if mean_world_q is None:
-        print(f"Failed to compute mean quaternion for {obj.name}")
+        print(f"Failed to average quaternions for {obj.name}")
         return 0
 
-    # Determine local quaternion that produces this world rotation
-    # If object has a parent, need to convert from world to local space
+    # convert world mean to local quaternion (respect parent)
     if obj.parent:
         parent_world_q = obj.parent.matrix_world.to_quaternion()
         local_q = parent_world_q.inverted() @ mean_world_q
     else:
         local_q = mean_world_q.copy()
 
-    # Ensure object uses quaternion rotation mode
+    # set rotation mode and apply rotation
     prev_mode = obj.rotation_mode
     obj.rotation_mode = 'QUATERNION'
-
-    # Apply the local rotation to the object (this will change the object's matrix_world)
     obj.rotation_quaternion = local_q
 
-    # Now rotate the object's base mesh vertices by inverse of the *local* rotation
-    # so that world-space vertex positions remain (approximately) identical.
+    # rotate base mesh vertices by inverse local rotation so world geometry remains
     inv_local_mat = local_q.to_matrix().inverted()
-
-    # Work on the object's actual mesh datablock (base mesh)
     mesh = obj.data
 
-    # If mesh is linked/shared between multiple objects, we operate in-place (modify shared mesh).
-    # Optionally, if you want per-object unique mesh, you could make a copy here.
+    # If multiple objects share the mesh, this will modify it for all users.
+    # If you don't want that, uncomment the following to make the mesh single-user:
+    # if mesh.users > 1:
+    #     obj.data = mesh.copy()
+    #     mesh = obj.data
 
-    # Rotate each vertex coordinate in object-local space
-    # NOTE: If the mesh has shape keys, modifiers, etc., this modifies base geometry only.
     for v in mesh.vertices:
         v.co = inv_local_mat @ v.co
 
-    # Update mesh to ensure changes are reflected
     mesh.update()
 
-    # Recompute object origin to geometry median (this will shift object.location so geometry stays put)
-    # Make this object active & selected for the operator to work correctly.
+    # Recompute origin to geometry median (optional; keeps origin at geometry center)
     prev_active = bpy.context.view_layer.objects.active
     prev_selected = list(bpy.context.selected_objects)
-
-    # select only this object and make it active
-    bpy.ops.object.mode_set(mode='OBJECT')  # ensure object mode
+    bpy.ops.object.mode_set(mode='OBJECT')
     for o in prev_selected:
         o.select_set(False)
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
-
-    # Origin set to geometry median
     bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='MEDIAN')
-
-    # restore selection / active
+    # restore
     for o in prev_selected:
         o.select_set(True)
     bpy.context.view_layer.objects.active = prev_active
 
-    # restore rotation mode if it was different (keep quaternion as the stored rotation though)
-    obj.rotation_mode = 'QUATERNION'  # keep quaternion mode because we explicitly set quaternion
-    # If you want to restore prev_mode uncomment next line (but it may convert quaternion to Euler)
-    # obj.rotation_mode = prev_mode
+    # keep quaternion rotation mode (we set it above)
+    obj.rotation_mode = 'QUATERNION'
 
-    print(f"Processed {obj.name}: {quad_count} quads -> applied rotation (world) {mean_world_q}.")
-
+    print(f"Processed {obj.name}: evaluated {quad_count} faces; applied rotation (world) {mean_world_q}.")
     return quad_count
 
 def main():
@@ -180,11 +228,11 @@ def main():
         print("Select at least one mesh object.")
         return
 
-    total_quads = 0
+    total = 0
     for obj in selected_meshes:
-        total_quads += process_object_apply_rotation(obj)
+        total += process_object_apply_rotation(obj)
 
-    print(f"\nDone — processed {len(selected_meshes)} objects, {total_quads} quads total.\n")
+    print(f"\nDone — processed {len(selected_meshes)} objects, {total} faces total.\n")
 
 if __name__ == "__main__":
     main()
